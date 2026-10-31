@@ -1,0 +1,636 @@
+---
+############################################################
+# ELK Stack 9.4.3 installation playbook
+# Maintainer: Majid Mortazavi
+# Based on the working ELK 9.1.1 playbook
+# Public repository edition
+#
+# Fresh single-server installation on Ubuntu 24.04.
+# NOT an in-place upgrade or migration playbook.
+#
+# Example:
+# ansible-playbook -i inventory.ini elk-play-9.4.3.yml \
+#   -e @vault.yml --ask-vault-pass
+#
+# Existing certificates and password markers are reused.
+# Changing Vault values does NOT rotate existing credentials.
+# Logstash ingestion pipelines are configured separately.
+############################################################
+
+- name: Install ELK Stack 9.4.3 on a single server
+  hosts: ELKServers
+  remote_user: "{{ ansible_ssh_user | default('root') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    elk_version: "9.4.3"
+    elasticsearch_package_version: "{{ elk_version }}"
+    kibana_package_version: "{{ elk_version }}"
+    logstash_package_version: "1:{{ elk_version }}-1"
+
+    # Repository configuration. Override these in inventory/group_vars.
+    nexus_repository_url: "https://nexus.example.com"
+    nexus_repository_base: "{{ nexus_repository_url }}/repository"
+    nexus_apt_proxy: "apt-proxy-noble"
+    nexus_apt_hosted: "apt-hosted"
+    nexus_hosted_suite: "noble"
+    nexus_hosted_components: "main"
+    ubuntu_components: "main restricted universe multiverse"
+    nexus_apt_key_url: "{{ nexus_repository_base }}/raw-keys/root/gpg/apt/public.gpg.key"
+
+    # Use the Ubuntu archive keyring for the Ubuntu proxy repository.
+    ubuntu_archive_keyring: "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+    nexus_apt_key_asc: "/usr/share/keyrings/nexus-apt.asc"
+    nexus_apt_key_gpg: "/usr/share/keyrings/nexus-apt.gpg"
+
+    elk_node_name: "{{ inventory_hostname }}"
+    # Set elk_server_ip explicitly when inventory_hostname is a DNS name.
+    elk_server_ip: "{{ ansible_host | default(inventory_hostname) }}"
+    elasticsearch_network_host: "0.0.0.0"
+    elasticsearch_http_port: 9200
+    elasticsearch_transport_port: 9300
+    elasticsearch_data_path: "/var/lib/elasticsearch"
+    elasticsearch_logs_path: "/var/log/elasticsearch"
+
+    kibana_server_host: "0.0.0.0"
+    kibana_server_port: 5601
+    kibana_public_url: "https://{{ elk_server_ip }}:{{ kibana_server_port }}"
+
+    # Secret values must be supplied through Ansible Vault.
+    server_ssl_keypassphrase: "{{ vault_kibana_key_pass }}"
+    elastic_password: "{{ vault_elastic_password }}"
+    kibana_system_password: "{{ vault_kibana_system_password }}"
+    logstash_system_password: "{{ vault_logstash_system_password }}"
+    kibana_encryption_key: "{{ vault_kibana_encryption_key }}"
+    es_p12_passphrase: "{{ vault_es_p12_pass }}"
+
+    # Private Fleet package registry. Set the complete URL, including scheme
+    # and port, to match your environment.
+    fleet_registry_url: "https://fleet-registry.example.com:8081"
+
+    elk_timezone: "Asia/Tehran"
+
+    cert_base_dir: "/etc/elastic-stack/certs"
+    cert_ca_dir: "{{ cert_base_dir }}/ca"
+    cert_es_dir: "/etc/elasticsearch/certs"
+    cert_kibana_dir: "/etc/kibana/certs"
+    cert_logstash_dir: "/etc/logstash/certs"
+    cert_tmp_dir: "/tmp/elk-certs"
+    ca_p12_file: "{{ cert_ca_dir }}/elastic-stack-ca.p12"
+    ca_crt_file: "{{ cert_ca_dir }}/elastic-stack-ca.crt"
+    es_p12_file: "{{ cert_es_dir }}/elasticsearch.p12"
+
+  pre_tasks:
+    - name: Verify supported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_version == "24.04"
+        fail_msg: "This playbook targets Ubuntu Server 24.04 LTS only."
+
+    - name: Verify required Vault values
+      ansible.builtin.assert:
+        that:
+          - (vault_elastic_password | default('') | length) >= 6
+          - (vault_kibana_system_password | default('') | length) >= 6
+          - (vault_logstash_system_password | default('') | length) >= 6
+          - (vault_kibana_encryption_key | default('') | length) >= 32
+          - (vault_kibana_key_pass | default('') | length) > 0
+          - (vault_es_p12_pass | default('') | length) > 0
+        fail_msg: "Load all six required vault_* variables. The Kibana encryption key must contain at least 32 characters."
+      no_log: true
+
+  tasks:
+    - name: Download Nexus APT public key
+      ansible.builtin.get_url:
+        url: "{{ nexus_apt_key_url }}"
+        dest: "{{ nexus_apt_key_asc }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Dearmor Nexus APT public key
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --dearmor
+          - --yes
+          - -o
+          - "{{ nexus_apt_key_gpg }}"
+          - "{{ nexus_apt_key_asc }}"
+      args:
+        creates: "{{ nexus_apt_key_gpg }}"
+
+    - name: Remove default Ubuntu source files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/ubuntu.sources
+        - /etc/apt/sources.list.d/ubuntu.sources.curtin.orig
+
+    - name: Configure Nexus APT repositories
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/nexus.list
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          deb [signed-by={{ ubuntu_archive_keyring }}] {{ nexus_repository_base }}/{{ nexus_apt_proxy }}/ noble {{ ubuntu_components }}
+          deb [signed-by={{ ubuntu_archive_keyring }}] {{ nexus_repository_base }}/{{ nexus_apt_proxy }}/ noble-updates {{ ubuntu_components }}
+          deb [signed-by={{ ubuntu_archive_keyring }}] {{ nexus_repository_base }}/{{ nexus_apt_proxy }}/ noble-security {{ ubuntu_components }}
+          deb [signed-by={{ ubuntu_archive_keyring }}] {{ nexus_repository_base }}/{{ nexus_apt_proxy }}/ noble-backports {{ ubuntu_components }}
+          deb [signed-by={{ nexus_apt_key_gpg }}] {{ nexus_repository_base }}/{{ nexus_apt_hosted }}/ {{ nexus_hosted_suite }} {{ nexus_hosted_components }}
+
+    - name: Install base packages and update APT cache
+      ansible.builtin.apt:
+        pkg:
+          - gnupg
+          - curl
+          - wget
+          - unzip
+          - zip
+          - vim
+          - openssl
+          - python3-pexpect
+          - apt-transport-https
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Read current timezone
+      ansible.builtin.command:
+        argv:
+          - timedatectl
+          - show
+          - --property=Timezone
+          - --value
+      register: current_timezone
+      changed_when: false
+
+    - name: Set system timezone
+      ansible.builtin.command:
+        argv:
+          - timedatectl
+          - set-timezone
+          - "{{ elk_timezone }}"
+      when: (current_timezone.stdout | trim) != elk_timezone
+
+    - name: Read available ELK package versions
+      ansible.builtin.command:
+        argv:
+          - apt-cache
+          - madison
+          - "{{ item.name }}"
+      loop:
+        - { name: elasticsearch, version: "{{ elasticsearch_package_version }}" }
+        - { name: kibana, version: "{{ kibana_package_version }}" }
+        - { name: logstash, version: "{{ logstash_package_version }}" }
+      register: elk_available_packages
+      changed_when: false
+
+    - name: Require exact requested package versions in APT repositories
+      ansible.builtin.assert:
+        that:
+          - item.item.version in item.stdout
+        fail_msg: >-
+          {{ item.item.name }}={{ item.item.version }} was not found in the
+          configured APT repositories. Check apt-cache madison {{ item.item.name }}
+          on the target server.
+      loop: "{{ elk_available_packages.results }}"
+      loop_control:
+        label: "{{ item.item.name }}={{ item.item.version }}"
+
+    - name: Install ELK packages
+      ansible.builtin.apt:
+        pkg:
+          - "elasticsearch={{ elasticsearch_package_version }}"
+          - "kibana={{ kibana_package_version }}"
+          - "logstash={{ logstash_package_version }}"
+        state: present
+        update_cache: false
+
+    - name: Read current vm.max_map_count
+      ansible.builtin.command:
+        argv:
+          - sysctl
+          - -n
+          - vm.max_map_count
+      register: elk_map_count
+      changed_when: false
+
+    - name: Persist sufficient vm.max_map_count without lowering an existing value
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-elasticsearch.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: "vm.max_map_count={{ [elk_map_count.stdout | int, 1048576] | max }}\n"
+
+    - name: Apply vm.max_map_count when required
+      ansible.builtin.command:
+        argv:
+          - sysctl
+          - -w
+          - vm.max_map_count=1048576
+      when: (elk_map_count.stdout | int) < 1048576
+
+    - name: Create certificate directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: "{{ item.group }}"
+        mode: "0750"
+      loop:
+        - { path: "{{ cert_base_dir }}", group: root }
+        - { path: "{{ cert_ca_dir }}", group: root }
+        - { path: "{{ cert_es_dir }}", group: elasticsearch }
+        - { path: "{{ cert_kibana_dir }}", group: kibana }
+        - { path: "{{ cert_logstash_dir }}", group: logstash }
+        - { path: "{{ cert_tmp_dir }}", group: root }
+
+    - name: Generate Elastic Stack CA
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-certutil
+          - ca
+          - --silent
+          - --pass
+          - ""
+          - --out
+          - "{{ ca_p12_file }}"
+      args:
+        creates: "{{ ca_p12_file }}"
+
+    - name: Restrict access to CA private key container
+      ansible.builtin.file:
+        path: "{{ ca_p12_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Export CA certificate to PEM
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - pkcs12
+          - -in
+          - "{{ ca_p12_file }}"
+          - -clcerts
+          - -nokeys
+          - -out
+          - "{{ ca_crt_file }}"
+          - -passin
+          - "pass:"
+      args:
+        creates: "{{ ca_crt_file }}"
+
+    - name: Generate Elasticsearch PKCS12 certificate
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-certutil
+          - cert
+          - --silent
+          - --pass
+          - "{{ es_p12_passphrase }}"
+          - --ca
+          - "{{ ca_p12_file }}"
+          - --ca-pass
+          - ""
+          - --name
+          - "{{ elk_node_name }}"
+          - --dns
+          - "localhost,{{ elk_node_name }}"
+          - --ip
+          - "127.0.0.1,{{ elk_server_ip }}"
+          - --out
+          - "{{ es_p12_file }}"
+      args:
+        creates: "{{ es_p12_file }}"
+      no_log: true
+      notify: restart elasticsearch
+
+    - name: Create instances file for Kibana and Logstash PEM certificates
+      ansible.builtin.copy:
+        dest: "{{ cert_tmp_dir }}/instances.yml"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          instances:
+            - name: kibana
+              dns: ["localhost", {{ elk_node_name | to_json }}]
+              ip: ["127.0.0.1", {{ elk_server_ip | to_json }}]
+            - name: logstash
+              dns: ["localhost", {{ elk_node_name | to_json }}]
+              ip: ["127.0.0.1", {{ elk_server_ip | to_json }}]
+
+    - name: Generate PEM certificates for Kibana and Logstash
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-certutil
+          - cert
+          - --silent
+          - --pem
+          - --pass
+          - "{{ server_ssl_keypassphrase }}"
+          - --ca
+          - "{{ ca_p12_file }}"
+          - --ca-pass
+          - ""
+          - --in
+          - "{{ cert_tmp_dir }}/instances.yml"
+          - --out
+          - "{{ cert_tmp_dir }}/elastic-stack-pem-certs.zip"
+      args:
+        creates: "{{ cert_tmp_dir }}/elastic-stack-pem-certs.zip"
+      no_log: true
+
+    - name: Extract PEM certificates
+      ansible.builtin.unarchive:
+        src: "{{ cert_tmp_dir }}/elastic-stack-pem-certs.zip"
+        dest: "{{ cert_tmp_dir }}"
+        remote_src: true
+        creates: "{{ cert_tmp_dir }}/kibana/kibana.crt"
+      no_log: true
+
+    - name: Install Kibana and Logstash certificates
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        remote_src: true
+        owner: root
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ cert_tmp_dir }}/kibana/kibana.crt", dest: "{{ cert_kibana_dir }}/kibana.crt", group: kibana, mode: "0640" }
+        - { src: "{{ cert_tmp_dir }}/kibana/kibana.key", dest: "{{ cert_kibana_dir }}/kibana.key", group: kibana, mode: "0640" }
+        - { src: "{{ ca_crt_file }}", dest: "{{ cert_kibana_dir }}/ca.crt", group: kibana, mode: "0644" }
+        - { src: "{{ cert_tmp_dir }}/logstash/logstash.crt", dest: "{{ cert_logstash_dir }}/logstash.crt", group: logstash, mode: "0640" }
+        - { src: "{{ cert_tmp_dir }}/logstash/logstash.key", dest: "{{ cert_logstash_dir }}/logstash.key", group: logstash, mode: "0640" }
+        - { src: "{{ ca_crt_file }}", dest: "{{ cert_logstash_dir }}/ca.crt", group: logstash, mode: "0644" }
+      no_log: true
+
+    - name: Set Elasticsearch certificate permissions
+      ansible.builtin.file:
+        path: "{{ es_p12_file }}"
+        owner: root
+        group: elasticsearch
+        mode: "0640"
+
+    - name: Configure elasticsearch.yml
+      ansible.builtin.copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+        content: |
+          cluster.name: elk-single-node
+          node.name: {{ elk_node_name | to_json }}
+          path.data: {{ elasticsearch_data_path | to_json }}
+          path.logs: {{ elasticsearch_logs_path | to_json }}
+          network.host: {{ elasticsearch_network_host | to_json }}
+          http.port: {{ elasticsearch_http_port }}
+          transport.port: {{ elasticsearch_transport_port }}
+          discovery.type: single-node
+          xpack.security.enabled: true
+          xpack.security.http.ssl.enabled: true
+          xpack.security.http.ssl.keystore.path: certs/elasticsearch.p12
+          xpack.security.http.ssl.truststore.path: certs/elasticsearch.p12
+          xpack.security.transport.ssl.enabled: true
+          xpack.security.transport.ssl.verification_mode: certificate
+          xpack.security.transport.ssl.keystore.path: certs/elasticsearch.p12
+          xpack.security.transport.ssl.truststore.path: certs/elasticsearch.p12
+          xpack.monitoring.collection.enabled: true
+      notify: restart elasticsearch
+
+    - name: Ensure Elasticsearch keystore exists
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-keystore
+          - create
+      args:
+        creates: /etc/elasticsearch/elasticsearch.keystore
+      environment:
+        ES_PATH_CONF: /etc/elasticsearch
+
+    - name: Add SSL passwords to Elasticsearch keystore
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-keystore
+          - add
+          - -x
+          - -f
+          - "{{ item.setting }}"
+        stdin: "{{ es_p12_passphrase }}"
+        stdin_add_newline: true
+      args:
+        creates: "/etc/elasticsearch/{{ item.flag }}"
+      environment:
+        ES_PATH_CONF: /etc/elasticsearch
+      loop:
+        - { setting: xpack.security.http.ssl.keystore.secure_password, flag: .http_ssl_keystore_password_set }
+        - { setting: xpack.security.http.ssl.truststore.secure_password, flag: .http_ssl_truststore_password_set }
+        - { setting: xpack.security.transport.ssl.keystore.secure_password, flag: .transport_ssl_keystore_password_set }
+        - { setting: xpack.security.transport.ssl.truststore.secure_password, flag: .transport_ssl_truststore_password_set }
+      register: es_ssl_password_results
+      no_log: true
+      notify: restart elasticsearch
+
+    - name: Mark successfully initialized Elasticsearch SSL passwords
+      ansible.builtin.copy:
+        dest: "/etc/elasticsearch/{{ item.item.flag }}"
+        content: "Initialized by Ansible\n"
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+      loop: "{{ es_ssl_password_results.results }}"
+      when: item is changed
+      no_log: true
+
+    - name: Set Elasticsearch keystore permissions
+      ansible.builtin.file:
+        path: /etc/elasticsearch/elasticsearch.keystore
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+
+    - name: Apply Elasticsearch configuration before authentication checks
+      ansible.builtin.meta: flush_handlers
+
+    - name: Start and enable Elasticsearch
+      ansible.builtin.systemd:
+        name: elasticsearch
+        state: started
+        enabled: true
+
+    - name: Wait for Elasticsearch HTTPS readiness
+      ansible.builtin.uri:
+        url: "https://localhost:{{ elasticsearch_http_port }}"
+        method: GET
+        status_code: [200, 401]
+        ca_path: "{{ ca_crt_file }}"
+      register: es_ready
+      until: (es_ready.status | default(-1)) in [200, 401]
+      retries: 60
+      delay: 5
+
+    - name: Initialize built-in Elasticsearch user passwords
+      ansible.builtin.expect:
+        command: >-
+          /usr/share/elasticsearch/bin/elasticsearch-reset-password
+          --url https://localhost:{{ elasticsearch_http_port }}
+          -u {{ item.username }} -i
+        responses:
+          'Please confirm that you would like to continue': "y"
+          'Enter password for \[.*\]': "{{ item.password }}"
+          'Re-enter password for \[.*\]': "{{ item.password }}"
+        creates: "/etc/elasticsearch/.{{ item.username }}_password_set"
+        timeout: 120
+        echo: false
+      environment:
+        ES_PATH_CONF: /etc/elasticsearch
+      loop:
+        - { username: elastic, password: "{{ elastic_password }}" }
+        - { username: kibana_system, password: "{{ kibana_system_password }}" }
+        - { username: logstash_system, password: "{{ logstash_system_password }}" }
+      register: elk_password_results
+      no_log: true
+
+    - name: Mark successfully initialized built-in passwords
+      ansible.builtin.copy:
+        dest: "/etc/elasticsearch/.{{ item.item.username }}_password_set"
+        content: "Initialized by Ansible\n"
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+      loop: "{{ elk_password_results.results }}"
+      when: item is changed
+      no_log: true
+
+    - name: Verify Elasticsearch authentication
+      ansible.builtin.uri:
+        url: "https://localhost:{{ elasticsearch_http_port }}"
+        method: GET
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        status_code: 200
+        ca_path: "{{ ca_crt_file }}"
+      register: es_auth_check
+      until: (es_auth_check.status | default(-1)) == 200
+      retries: 30
+      delay: 5
+      no_log: true
+
+    - name: Verify Elasticsearch version
+      ansible.builtin.assert:
+        that:
+          - es_auth_check.json.version.number == elk_version
+        fail_msg: "Elasticsearch is not running the requested version."
+
+    - name: Configure kibana.yml
+      ansible.builtin.copy:
+        dest: /etc/kibana/kibana.yml
+        owner: root
+        group: kibana
+        mode: "0660"
+        content: |
+          server.host: {{ kibana_server_host | to_json }}
+          server.port: {{ kibana_server_port }}
+          server.name: elk-kibana
+          server.publicBaseUrl: {{ kibana_public_url | to_json }}
+          server.ssl.enabled: true
+          server.ssl.certificate: {{ (cert_kibana_dir ~ '/kibana.crt') | to_json }}
+          server.ssl.key: {{ (cert_kibana_dir ~ '/kibana.key') | to_json }}
+          server.ssl.keyPassphrase: {{ server_ssl_keypassphrase | to_json }}
+          elasticsearch.hosts: ["https://localhost:{{ elasticsearch_http_port }}"]
+          elasticsearch.username: kibana_system
+          elasticsearch.password: {{ kibana_system_password | to_json }}
+          elasticsearch.ssl.certificateAuthorities: [{{ (cert_kibana_dir ~ '/ca.crt') | to_json }}]
+          elasticsearch.ssl.verificationMode: full
+          xpack.encryptedSavedObjects.encryptionKey: {{ kibana_encryption_key | to_json }}
+          xpack.fleet.registryUrl: {{ fleet_registry_url | to_json }}
+          xpack.fleet.isAirGapped: true
+      no_log: true
+      notify: restart kibana
+
+    - name: Configure logstash.yml
+      ansible.builtin.copy:
+        dest: /etc/logstash/logstash.yml
+        owner: root
+        group: logstash
+        mode: "0660"
+        content: |
+          node.name: {{ elk_node_name | to_json }}
+          path.data: /var/lib/logstash
+          path.logs: /var/log/logstash
+          xpack.monitoring.allow_legacy_collection: true
+          xpack.monitoring.enabled: true
+          xpack.monitoring.elasticsearch.hosts: ["https://localhost:{{ elasticsearch_http_port }}"]
+          xpack.monitoring.elasticsearch.username: logstash_system
+          xpack.monitoring.elasticsearch.password: {{ logstash_system_password | to_json }}
+          xpack.monitoring.elasticsearch.ssl.certificate_authority: {{ (cert_logstash_dir ~ '/ca.crt') | to_json }}
+          xpack.monitoring.elasticsearch.ssl.verification_mode: full
+          api.enabled: true
+          api.http.host: 0.0.0.0
+          api.http.port: 9600
+      no_log: true
+      notify: restart logstash
+
+    - name: Apply Kibana and Logstash configuration before health checks
+      ansible.builtin.meta: flush_handlers
+
+    - name: Start and enable Kibana and Logstash
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - kibana
+        - logstash
+
+    - name: Wait for Kibana HTTPS endpoint
+      ansible.builtin.uri:
+        url: "https://localhost:{{ kibana_server_port }}/api/status"
+        method: GET
+        status_code: 200
+        ca_path: "{{ ca_crt_file }}"
+      register: kibana_status
+      until: (kibana_status.status | default(-1)) == 200
+      retries: 60
+      delay: 5
+
+    - name: Display installation summary
+      ansible.builtin.debug:
+        msg: |
+          Elasticsearch {{ elk_version }} authentication and version verified.
+          Kibana HTTPS status endpoint responded successfully.
+          Elasticsearch: https://{{ elk_server_ip }}:{{ elasticsearch_http_port }}
+          Kibana: https://{{ elk_server_ip }}:{{ kibana_server_port }}
+          Kibana login user: elastic
+          CA certificate: {{ ca_crt_file }}
+          Elasticsearch PKCS12: {{ es_p12_file }}
+          Kibana certificates: {{ cert_kibana_dir }}
+          Logstash certificates: {{ cert_logstash_dir }}
+          Logstash ingestion pipelines must be configured separately in /etc/logstash/conf.d/.
+          Check Logstash runtime health after adding an ingestion pipeline.
+          The air-gapped Fleet registry must provide integrations compatible with Kibana {{ elk_version }}.
+
+  handlers:
+    - name: restart elasticsearch
+      ansible.builtin.systemd:
+        name: elasticsearch
+        state: restarted
+
+    - name: restart kibana
+      ansible.builtin.systemd:
+        name: kibana
+        state: restarted
+
+    - name: restart logstash
+      ansible.builtin.systemd:
+        name: logstash
+        state: restarted
