@@ -1,0 +1,28 @@
+# Local inventory and environment-specific configuration
+inventory.ini
+inventory
+hosts
+group_vars/all/vault.yml
+host_vars/
+
+# Ansible Vault and secret files
+vault.yml
+vault.yaml
+*.vault
+.vault_pass
+.vault-password
+
+# Private keys and certificates
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.crt
+
+# Ansible and local artifacts
+*.retry
+*.log
+.DS_Store
+.vscode/
+.idea/
