@@ -1,0 +1,10 @@
+# Copy this file to vault.yml and replace every placeholder.
+# Encrypt the local vault.yml file with ansible-vault.
+# Never commit real credentials or an unencrypted vault file.
+
+vault_elastic_password: "REPLACE_WITH_A_STRONG_PASSWORD"
+vault_kibana_system_password: "REPLACE_WITH_A_STRONG_PASSWORD"
+vault_logstash_system_password: "REPLACE_WITH_A_STRONG_PASSWORD"
+vault_kibana_encryption_key: "REPLACE_WITH_AT_LEAST_32_RANDOM_CHARACTERS"
+vault_kibana_key_pass: "REPLACE_WITH_A_CERTIFICATE_PASSPHRASE"
+vault_es_p12_pass: "REPLACE_WITH_A_CERTIFICATE_PASSPHRASE"
